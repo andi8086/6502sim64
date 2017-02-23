@@ -37,6 +37,24 @@ _FLAG_C equ 0x01
     or byte [sregs + _6502_CPUREGS.F], al
 %endmacro
 
+%macro TRANSFLAGS_ZSCO 0
+    pushf
+    pop ax
+    mov dl, ah
+    mov bl, al
+    and al, 0x81    ; keep N and C flags
+    xor cl, cl
+    rcl bl, 2       ; rotate Z into carry (bit 6 -> C)
+    rcl cl, 2       ; rotate carry into Z (C -> bit 1)
+    or al, cl       ; al contains Z and N flag
+    and byte [sregs + _6502_CPUREGS.F], ~(_FLAG_Z | _FLAG_N | _FLAG_C | _FLAG_V)
+    or byte [sregs + _6502_CPUREGS.F], al
+    rcr dl, 4       ; rotate overflow flag into carry
+    xor al, al
+    rcr al, 2       ; rotate overflwo flag into V flag position
+    or byte [sregs + _6502_CPUREGS.F], al
+%endmacro
+
 %macro PUSH6_AL 0
     xor rbx, rbx
     mov rcx, qword [procmem]
@@ -59,6 +77,19 @@ _FLAG_C equ 0x01
     mov bl, byte [sregs + _6502_CPUREGS.S]
     mov al, byte [rcx + rbx + 0x100]
     inc byte [sregs + _6502_CPUREGS.S]
+%endmacro
+
+%macro JMPREL 1
+    ; al contains signed byte to be added to PC
+    cbw ; sign extend to ax
+    test ax, ax
+    js %1_offset_neg
+    add word [sregs + _6502_CPUREGS.PC], ax
+    jmp %1_jmprelcont
+%1_offset_neg:
+    neg ax
+    sub word [sregs + _6502_CPUREGS.PC], ax
+%1_jmprelcont:
 %endmacro
 
 section .text
@@ -206,7 +237,7 @@ setup_src_dest:
     mov qword [inst_operand], rax
     inc word [sregs + _6502_CPUREGS.PC]
     ret
-lsd0:                   
+lsd0:
     cmp bl, 5 ;          zpg, X
     jne lsd1
     lodsb
@@ -303,7 +334,7 @@ lsd_nocarry5:
     mov qword [inst_operand], rax
     ret
 lsd6:
-    cmp bl, 2 ;
+    cmp bl, 2 ;           A or X
     jne lsd7
     cmp cl, 0xB0
     je _DEX
@@ -320,14 +351,13 @@ lsd7:
 _interpret_line00:
     cmp bl, 0
     jnz l00n1
-    ; BRK                               
+    ; BRK
     xor rax, rax
     mov ax, word [sregs + _6502_CPUREGS.PC]
-    inc ax
-    inc ax
+    inc ax          ; already was incremented before
     xchg al, ah
     PUSH6_AL        ; store PC(hi)
-    xchg al, ah          
+    xchg al, ah
     PUSH6_AL        ; store PC(lo)
     mov al, byte [sregs + _6502_CPUREGS.F]
     or al, _FLAG_B  ; set B flag
@@ -337,17 +367,24 @@ _interpret_line00:
     lodsw           ; fetch PC(lo), then fetch PC(hi)
     mov word [sregs + _6502_CPUREGS.PC], ax
     ret
-l00n1:   
+l00n1:
     cmp bl, 2
     jnz l00n2
-    ; PHP                               
+    ; PHP
     mov al, byte [sregs + _6502_CPUREGS.F]
     PUSH6_AL
     ret
 l00n2:
     cmp bl, 4
     jnz l00n3
-    ; BPL rel                           TODO
+    ; BPL rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_N
+    jnz nobpl
+    lodsb
+    JMPREL bpl
+    ret
+nobpl:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l00n3:
     cmp bl, 6
@@ -361,29 +398,78 @@ l00n4:
 _interpret_line08:
     cmp bl, 0
     jnz l08n1
-    ; JSR abs                           TODO 
+    ; JSR abs
+            ; PUSH PC+2
+            ; (PC+1) -> PCL
+            ; (PC+2) -> PCH
+    mov dx, word [rsi]  ; LOAD new PC
+    mov ax, word [sregs + _6502_CPUREGS.PC]
+    inc ax  ; we already had PC+1 before
+    xchg al, ah
+    PUSH6_AL        ; store PC(hi)
+    xchg al, ah
+    PUSH6_AL        ; store PC(lo)
+    mov word [sregs + _6502_CPUREGS.PC], dx
     ret
-l08n1:   
+l08n1:
     cmp bl, 1
     jnz l08n1b
-    ; BIT zpg                           TODO
+    ; BIT zpg
+    xor rax, rax
+    lodsb
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    test al, byte [sregs + _6502_CPUREGS.A]
+    jz bit_setz
+    and byte [sregs + _6502_CPUREGS.F], ~_FLAG_Z
+    jmp bit_cont
+bit_setz:
+    or byte [sregs + _6502_CPUREGS.F], _FLAG_Z
+bit_cont:
+    and al, 0xC0
+    and byte [sregs + _6502_CPUREGS.F], 0x3F
+    or byte [sregs + _6502_CPUREGS.F], al
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l08n1b:
     cmp bl, 2
     jnz l08n2
-    ; PLP                               
+    ; PLP
     POP6_AL
     mov byte [sregs + _6502_CPUREGS.F], al
     ret
 l08n2:
     cmp bl, 3
     jnz l08n2b
-    ; BIT abs                           TODO
+    ; BIT abs
+    xor rax, rax
+    lodsw
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    test al, byte [sregs + _6502_CPUREGS.A]
+    jz bita_setz
+    and byte [sregs + _6502_CPUREGS.F], ~_FLAG_Z
+    jmp bita_cont
+bita_setz:
+    or byte [sregs + _6502_CPUREGS.F], _FLAG_Z
+bita_cont:
+    and al, 0xC0
+    and byte [sregs + _6502_CPUREGS.F], 0x3F
+    or byte [sregs + _6502_CPUREGS.F], al
+    inc word [sregs + _6502_CPUREGS.PC]
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l08n2b:
     cmp bl, 4
     jnz l08n3
-    ; BMI rel                           TODO
+    ; BMI rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_N
+    jz nobmi
+    lodsb
+    JMPREL bmi
+    ret
+nobmi:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l08n3:
     cmp bl, 6
@@ -398,24 +484,41 @@ l08n4:
 _interpret_line10:
     cmp bl, 0
     jnz l10n1
-    ; RTI                               TODO 
+    ; RTI
+    POP6_AL
+    mov byte [sregs + _6502_CPUREGS.F], al
+    POP6_AL
+    xchg al, ah
+    POP6_AL
+    xchg al, ah
+    inc ax              ; TODO is this correct?
+    mov word [sregs + _6502_CPUREGS.PC], ax
     ret
-l10n1:   
+l10n1:
     cmp bl, 2
     jnz l10n2
-    ; PHA                               
+    ; PHA
     mov al, byte [sregs + _6502_CPUREGS.A]
     PUSH6_AL
     ret
 l10n2:
     cmp bl, 3
     jnz l10n2b
-    ; JMP abs                           TODO
+    ; JMP abs
+    lodsw
+    mov word [sregs + _6502_CPUREGS.PC], ax
     ret
 l10n2b:
     cmp bl, 4
     jnz l10n3
-    ; BVC rel                           TODO
+    ; BVC rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_V
+    jnz nobvc
+    lodsb
+    JMPREL bvc
+    ret
+nobvc:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l10n3:
     cmp bl, 6
@@ -429,9 +532,15 @@ l10n4:
 _interpret_line18:
     cmp bl, 0
     jnz l18n1
-    ; RTS                               TODO 
+    ; RTS
+    POP6_AL
+    xchg al, ah
+    POP6_AL
+    xchg al, ah
+    inc ax
+    mov word [sregs + _6502_CPUREGS.PC], ax
     ret
-l18n1:   
+l18n1:
     cmp bl, 2
     jnz l18n2
     ; PLA
@@ -442,12 +551,24 @@ l18n1:
 l18n2:
     cmp bl, 3
     jnz l18n2b
-    ; JMP ind                           TODO
+    ; JMP ind
+    xor rax, rax
+    lodsw
+    add rax, qword [procmem]
+    mov ax, word [rax]
+    mov word [sregs + _6502_CPUREGS.PC], ax
     ret
 l18n2b:
     cmp bl, 4
     jnz l18n3
-    ; BVS rel                           TODO
+    ; BVS rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_V
+    jz nobvs
+    lodsb
+    JMPREL bvs
+    ret
+nobvs:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l18n3:
     cmp bl, 6
@@ -462,7 +583,13 @@ l18n4:
 _interpret_line20:
     cmp bl, 1
     jnz l20n1
-    ; STY zpg                           TODO
+    ; STY zpg
+    xor rax, rax
+    lodsb
+    add rax, qword [procmem]
+    mov bl, byte [sregs + _6502_CPUREGS.Y]
+    mov byte [rax], bl
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l20n1:   
     cmp bl, 2
@@ -485,22 +612,45 @@ l20n1_nozero:
 l20n2:
     cmp bl, 3
     jnz l20n2b
-    ; STY abs                           TODO
+    ; STY abs
+    xor rax, rax
+    lodsw
+    add rax, qword [procmem]
+    mov bl, byte [sregs + _6502_CPUREGS.Y]
+    mov byte [rax], bl
+    inc word [sregs + _6502_CPUREGS.PC]
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l20n2b:
     cmp bl, 4
     jnz l20n3
-    ; BCC rel                           TODO
+    ; BCC rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_C
+    jnz nobcc
+    lodsb
+    JMPREL bcc
+    ret
+nobcc:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l20n3:
     cmp bl, 5
     jnz l20n3b
-    ; STY zpg, X                        TODO
+    ; STY zpg, X
+    xor rax, rax
+    lodsb
+    add al, byte [sregs + _6502_CPUREGS.X]
+    add rax, qword [procmem]
+    mov bl, byte [sregs + _6502_CPUREGS.Y]
+    mov byte [rax], bl
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l20n3b:
     cmp bl, 6
     jnz l20n4
-    ; TYA                               TODO
+    ; TYA
+    mov al, byte [sregs + _6502_CPUREGS.Y]
+    mov byte [sregs + _6502_CPUREGS.A], al
     ret
 l20n4:
     ret
@@ -508,32 +658,64 @@ l20n4:
 _interpret_line28:
     cmp bl, 0
     jnz l28n0
-    ; LDY #                             TODO
+    ; LDY #
+    lodsb
+    mov byte [sregs + _6502_CPUREGS.Y], al
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l28n0:
     cmp bl, 1
     jnz l28n1
-    ; LDY zpg                           TODO
+    ; LDY zpg
+    xor rax, rax
+    lodsb
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov byte [sregs + _6502_CPUREGS.Y], al
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l28n1:
     cmp bl, 2
     jnz l28n2
-    ; TAY                               TODO
+    ; TAY
+    mov al, byte [sregs + _6502_CPUREGS.A]
+    mov byte [sregs + _6502_CPUREGS.Y], al
     ret
 l28n2:
     cmp bl, 3
     jnz l28n2b
-    ; LDY abs                           TODO
+    ; LDY abs
+    xor rax, rax
+    lodsw
+    add rax, qword [procmem]
+    mov byte al, [rax]
+    mov byte [sregs + _6502_CPUREGS.Y], al
+    inc word [sregs + _6502_CPUREGS.PC]
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l28n2b:
     cmp bl, 4
     jnz l28n3
-    ; BCS rel                           TODO
+    ; BCS rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_C
+    jz nobcs
+    lodsb
+    JMPREL bcs
+    ret
+nobcs:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l28n3:
     cmp bl, 5
     jnz l28n3b
-    ; LDY zpg, x                        TODO
+    ; LDY zpg, x
+    xor rax, rax
+    lodsb
+    add al, byte [sregs + _6502_CPUREGS.X]
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov byte [sregs + _6502_CPUREGS.Y], al
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l28n3b:
     cmp bl, 6
@@ -542,18 +724,40 @@ l28n3b:
     and byte [sregs + _6502_CPUREGS.F], ~_FLAG_V
     ret
 l28n4:
-    ; LDY abs, X                        TODO
+    ; LDY abs, X
+    xor rax, rax
+    lodsw
+    add al, byte [sregs + _6502_CPUREGS.X]
+    adc ah, 1
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov byte [sregs + _6502_CPUREGS.Y], al
+    inc word [sregs + _6502_CPUREGS.PC]
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 
 _interpret_line30:
     cmp bl, 0
     jnz l30n1
-    ; CPY #                             TODO
+    ; CPY #
+    lodsb
+    mov bl, byte [sregs +_6502_CPUREGS.Y]
+    sub bl, al
+    TRANSFLAGS_ZSC 1
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l30n1:   
     cmp bl, 1
     jnz l30n2
-    ; CPY zpg                           TODO
+    ; CPY zpg
+    xor rax, rax
+    lodsb
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov bl, byte [sregs + _6502_CPUREGS.Y]
+    sub bl, al
+    TRANSFLAGS_ZSC 1
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l30n2:
     cmp bl, 2
@@ -576,12 +780,28 @@ l30n2_nozero:
 l30n2b:
     cmp bl, 3
     jnz l30n3
-    ; CPY abs                           TODO
+    ; CPY abs
+    xor rax, rax
+    lodsw
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov bl, byte [sregs + _6502_CPUREGS.Y]
+    sub bl, al
+    TRANSFLAGS_ZSC 1
+    inc word [sregs + _6502_CPUREGS.PC]
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l30n3:
     cmp bl, 4
     jnz l30n3b
-    ; BNE rel                           TODO
+    ; BNE rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_Z
+    jnz nobne
+    lodsb
+    JMPREL bne
+    ret
+nobne:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l30n3b:
     cmp bl, 6
@@ -595,12 +815,25 @@ l30n4:
 _interpret_line38:
     cmp bl, 0
     jnz l38n1
-    ; CPX #                             TODO
+    ; CPX # 
+    lodsb
+    mov bl, byte [sregs +_6502_CPUREGS.X]
+    sub bl, al
+    TRANSFLAGS_ZSC 1
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l38n1:   
     cmp bl, 1
     jnz l38n2
-    ; CPX zpg                           TODO
+    ; CPX zpg
+    xor rax, rax
+    lodsb
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov bl, byte [sregs + _6502_CPUREGS.X]
+    sub bl, al
+    TRANSFLAGS_ZSC 1
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l38n2:
     cmp bl, 2
@@ -623,12 +856,28 @@ l38n2_nozero:
 l38n2b:
     cmp bl, 3
     jnz l38n3
-    ; CPX abs                           TODO
+    ; CPX abs
+    xor rax, rax
+    lodsw
+    add rax, qword [procmem]
+    mov al, byte [rax]
+    mov bl, byte [sregs + _6502_CPUREGS.X]
+    sub bl, al
+    TRANSFLAGS_ZSC 1
+    inc word [sregs + _6502_CPUREGS.PC]
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l38n3:
     cmp bl, 4
     jnz l38n3b
-    ; BEQ rel                           TODO
+    ; BEQ rel
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_Z
+    jz nobeq
+    lodsb
+    JMPREL beq
+    ret
+nobeq:
+    inc word [sregs + _6502_CPUREGS.PC]
     ret
 l38n3b:
     cmp bl, 6
@@ -673,7 +922,98 @@ _do_EORb:
     ret
 
 _do_ADC:
-                                         ;TODO
+    ; trick was to use the add with bcd support of the x86 :)
+    ; but the "daa" instruction is not available in x86_64 mode
+    ; SHIT !!!!!
+    xor rbx, rbx
+    mov rax, qword [inst_operand]
+    mov bl, byte [rax]
+_ADC_from_SBC:
+    mov al, byte [sregs + _6502_CPUREGS.A]
+    push rax
+    push rbx
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_D
+    jnz _do_ADC_bcd
+
+    ; Add in binary mode
+    ; Set carry if set on 6502
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_C
+    jz ADC_clc
+    stc
+    jmp ADC_cont
+ADC_clc:
+    clc
+ADC_cont:
+    adc al, bl
+    TRANSFLAGS_ZSCO
+    pop rbx
+    pop rax
+    ret
+
+_do_ADC_bcd:
+    ; Add in BCD mode
+    ; Set carry if set on 6502
+    test byte [sregs + _6502_CPUREGS.F], _FLAG_C
+    jz ADC2_clc
+    stc
+    jmp ADC2_cont
+ADC2_clc:
+    clc
+ADC2_cont:
+    mov cl, al
+    mov dl, bl
+    and cl, 0x0F
+    and dl, 0x0F
+    adc cl, dl
+    cmp cl, 0x0A
+    jb no_daa1
+    add cl, 6
+no_daa1:
+    ; now, the high nibble can be non-zero
+    ; the carry flag must be zero now
+    and al, 0xF0
+    and bl, 0xF0
+    add cl, al      ; here, carry is impossible
+    add cl, bl      ; here carry can occur
+    jnc daa_nc1
+    mov dl, _FLAG_C
+daa_nc1:
+    cmp cl, 0x99
+    jb no_daa2
+    add cl, 0x60    ; here, carry can occur
+    jnc daa_nc2
+    mov dl, _FLAG_C
+daa_nc2:
+no_daa2:
+    mov byte [sregs + _6502_CPUREGS.A], cl ;store result
+    pop rbx ; restore original operands
+    pop rax
+    mov cl, al
+    and al, 0x80
+    and bl, 0x80
+    xor al, bl
+    ; if both signs are different, xor gives non-zero and
+    ; overflow is not possible
+    jnz bcd_no_overflow
+    ; here, highest bit is 0
+    xor al, [sregs + _6502_CPUREGS.A]
+    test al, 0x80
+    ; if the sign of the result equals the sign of the operands
+    ; xor returns 0 and no overflow happened
+    jz bcd_no_overflow
+    or dl, _FLAG_V  ; set overflow flag
+bcd_no_overflow:
+    mov al, [sregs + _6502_CPUREGS.A]
+    test al, al
+    jnz bcd_nonzero
+    or dl, _FLAG_Z
+bcd_nonzero:
+    test al, 0x80
+    jnz bcd_plus
+    or dl, _FLAG_N
+bcd_plus:
+    and byte [sregs + _6502_CPUREGS.F], ~(_FLAG_V | _FLAG_C | _FLAG_N | _FLAG_Z)
+    or byte [sregs + _6502_CPUREGS.F], dl
     ret
 
 _do_STA:
@@ -706,7 +1046,12 @@ _do_CMPb:
     ret
 
 _do_SBC:
-                                        ; TODO
+    xor rbx, rbx
+    mov rax, qword [inst_operand]
+    mov bl, byte [rax]
+    neg bl
+    jmp _ADC_from_SBC
+    ; never reached
     ret
 
 _do_ASL:
@@ -721,7 +1066,7 @@ _do_ROL:
     test byte [sregs + _6502_CPUREGS.S], 1
     jz _do_ROL_nc
     stc
-_do_ROL_nc: 
+_do_ROL_nc:
     rcl byte [rax], 1
     TRANSFLAGS_ZSC 1
     ret
@@ -738,7 +1083,7 @@ _do_ROR:
     test byte [sregs + _6502_CPUREGS.S], 1
     jz _do_ROR_nc
     stc
-_do_ROR_nc: 
+_do_ROR_nc:
     rcr byte [rax], 1
     TRANSFLAGS_ZSC 1
     ret
